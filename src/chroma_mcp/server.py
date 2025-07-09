@@ -11,6 +11,14 @@ import uuid
 import time
 import json
 import pathlib
+import zipfile
+import tarfile
+import rarfile
+import shutil
+import tempfile
+import pandas as pd
+from sentence_transformers import SentenceTransformer
+import py7zr
 
 
 from chromadb.api.collection_configuration import (
@@ -724,6 +732,134 @@ async def chroma_add_documents_from_files(
         raise Exception("No content found in provided files.")
     # Use existing chroma_add_documents tool
     return await chroma_add_documents(collection_name, all_chunks, all_ids, all_metadatas)
+
+# Utility: Extract supported archives if <15MB
+
+
+def extract_archive(archive_path: str, extract_dir: str) -> list[str]:
+    """Extract .zip, .tar, .tar.gz, .tgz, .rar, .7z archives <15MB. Returns list of extracted file paths."""
+    if os.path.getsize(archive_path) > 15 * 1024 * 1024:
+        raise Exception(f"Archive {archive_path} is too large (>15MB)")
+    extracted_files = []
+    if zipfile.is_zipfile(archive_path):
+        with zipfile.ZipFile(archive_path, 'r') as z:
+            z.extractall(extract_dir)
+            extracted_files = [os.path.join(extract_dir, f)
+                               for f in z.namelist()]
+    elif tarfile.is_tarfile(archive_path):
+        with tarfile.open(archive_path, 'r:*') as t:
+            t.extractall(extract_dir)
+            extracted_files = [os.path.join(extract_dir, f)
+                               for f in t.getnames()]
+    elif archive_path.lower().endswith('.rar'):
+        with rarfile.RarFile(archive_path) as r:
+            r.extractall(extract_dir)
+            extracted_files = [os.path.join(extract_dir, f)
+                               for f in r.namelist()]
+    elif archive_path.lower().endswith('.7z'):
+        with py7zr.SevenZipFile(archive_path, mode='r') as z:
+            z.extractall(path=extract_dir)
+            extracted_files = [os.path.join(extract_dir, f)
+                               for f in z.getnames()]
+    else:
+        raise Exception(f"Unsupported archive type: {archive_path}")
+    # Flatten directories
+    all_files = []
+    for f in extracted_files:
+        if os.path.isdir(f):
+            for root, _, files in os.walk(f):
+                for file in files:
+                    all_files.append(os.path.join(root, file))
+        else:
+            all_files.append(f)
+    return all_files
+
+# Utility: Find .csv, .txt, .log files
+
+
+def find_vectorizable_files(paths: list[str]) -> list[str]:
+    result_files = []
+    for path in paths:
+        abs_path = pathlib.Path(path).expanduser().resolve()
+        if abs_path.is_file() and abs_path.suffix.lower() in {'.csv', '.txt', '.log'}:
+            result_files.append(str(abs_path))
+        elif abs_path.is_dir():
+            for file in abs_path.rglob("*"):
+                if file.is_file() and file.suffix.lower() in {'.csv', '.txt', '.log'}:
+                    result_files.append(str(file))
+    return result_files
+
+# Utility: Vectorize CSV file using sentence-transformers
+
+
+def vectorize_csv(file_path: str, model_name: str = "all-MiniLM-L6-v2") -> tuple[list[str], list[dict]]:
+    df = pd.read_csv(file_path)
+    # Concatenate all string columns per row
+    text_data = df.select_dtypes(include=['object']).astype(
+        str).agg(' '.join, axis=1).tolist()
+    if not text_data:
+        return [], []
+    model = SentenceTransformer(model_name)
+    # This returns a list of embeddings, but for Chroma we want to add the text as documents
+    # (Chroma will embed them using its own embedding function)
+    # So we just return the text and metadata
+    metadatas = [{"file": file_path, "row": i} for i in range(len(text_data))]
+    return text_data, metadatas
+
+# New MCP tool: Add documents from archive
+@mcp.tool()
+async def chroma_add_documents_from_archive(
+    collection_name: str,
+    archive_path: str,
+    encoding: str = "utf-8",
+    chunk_size: int = 2000,
+    overlap: int = 200,
+    model_name: str = "all-MiniLM-L6-v2"
+) -> str:
+    """Extract an archive (<15MB), find .csv/.txt/.log files, vectorize, and add to a Chroma collection.
+    Args:
+        collection_name: Name of the collection to add documents to
+        archive_path: Path to the archive file
+        encoding: File encoding for .txt/.log (default utf-8)
+        chunk_size: Max size of each chunk for .txt/.log (in characters)
+        overlap: Overlap between chunks (in characters)
+        model_name: SentenceTransformer model for CSVs (default all-MiniLM-L6-v2)
+    Returns:
+        Confirmation message with number of documents added.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extracted_files = extract_archive(archive_path, tmpdir)
+        vectorizable = find_vectorizable_files(extracted_files)
+        if not vectorizable:
+            raise Exception("No .csv, .txt, or .log files found in archive.")
+        all_docs = []
+        all_ids = []
+        all_metadatas = []
+        for file_path in vectorizable:
+            ext = pathlib.Path(file_path).suffix.lower()
+            if ext == '.csv':
+                docs, metadatas = vectorize_csv(file_path, model_name)
+                ids = [
+                    f"{pathlib.Path(file_path).stem}_row_{i}" for i in range(len(docs))]
+                all_docs.extend(docs)
+                all_ids.extend(ids)
+                all_metadatas.extend(metadatas)
+            else:  # .txt or .log
+                content = read_file_content(file_path, encoding=encoding)
+                if not content.strip():
+                    continue
+                chunks = chunk_text(
+                    content, chunk_size=chunk_size, overlap=overlap)
+                ids = [
+                    f"{pathlib.Path(file_path).stem}_chunk_{i}" for i in range(len(chunks))]
+                metadatas = [{"file": file_path, "chunk_index": i}
+                             for i in range(len(chunks))]
+                all_docs.extend(chunks)
+                all_ids.extend(ids)
+                all_metadatas.extend(metadatas)
+        if not all_docs:
+            raise Exception("No content found in vectorizable files.")
+        return await chroma_add_documents(collection_name, all_docs, all_ids, all_metadatas)
 
 
 def main():
