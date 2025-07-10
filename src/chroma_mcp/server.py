@@ -693,19 +693,24 @@ async def chroma_add_documents_from_files(
     metadatas: list[dict] | None = None
 ) -> str:
     """Read content from files, directories, or archives, chunk if needed, and add as documents to a Chroma collection.
+    Streams large CSVs and text files to avoid memory issues.
     Args:
         collection_name: Name of the collection to add documents to
         file_or_dir_paths: List of file, directory, or archive paths to read
-        chunk_size: Max size of each chunk (in characters)
-        overlap: Overlap between chunks (in characters)
+        chunk_size: Max size of each text chunk (in characters)
+        overlap: Overlap between text chunks (in characters)
         encoding: File encoding (default utf-8)
         metadatas: Optional list of metadata dicts (one per chunk, or None)
     Returns:
         Confirmation message with number of documents added.
     """
     import tempfile
+    import itertools
     all_files = []
     temp_dirs = []
+    BATCH_SIZE = 5000
+    CSV_CHUNK_ROWS = 1000
+    total_added = 0
     try:
         for path in file_or_dir_paths:
             abs_path = pathlib.Path(path).expanduser().resolve()
@@ -733,34 +738,59 @@ async def chroma_add_documents_from_files(
         if not vectorizable:
             raise Exception(
                 "No .csv, .txt, or .log files found in provided paths or extracted archives.")
-        all_docs = []
-        all_ids = []
-        all_metadatas = []
         for file_path in vectorizable:
             ext = pathlib.Path(file_path).suffix.lower()
             if ext == '.csv':
-                docs, metadatas_csv = vectorize_csv(file_path)
-                ids = [
-                    f"{pathlib.Path(file_path).stem}_row_{i}" for i in range(len(docs))]
-                all_docs.extend(docs)
-                all_ids.extend(ids)
-                all_metadatas.extend(metadatas_csv)
+                # Stream CSV in chunks
+                for chunk in pd.read_csv(file_path, chunksize=CSV_CHUNK_ROWS):
+                    text_data = chunk.select_dtypes(include=['object']).astype(
+                        str).agg(' '.join, axis=1).tolist()
+                    if not text_data:
+                        continue
+                    metadatas_csv = [{"file": file_path, "row": i}
+                                     for i in range(len(text_data))]
+                    ids = [f"{pathlib.Path(file_path).stem}_row_{i}" for i in range(
+                        len(text_data))]
+                    # Batch upload
+                    for i in range(0, len(text_data), BATCH_SIZE):
+                        batch_docs = text_data[i:i+BATCH_SIZE]
+                        batch_ids = ids[i:i+BATCH_SIZE]
+                        batch_metadatas = metadatas_csv[i:i+BATCH_SIZE]
+                        await chroma_add_documents(collection_name, batch_docs, batch_ids, batch_metadatas)
+                        total_added += len(batch_docs)
             else:  # .txt or .log
-                content = read_file_content(file_path, encoding=encoding)
-                if not content.strip():
-                    continue
-                chunks = chunk_text(
-                    content, chunk_size=chunk_size, overlap=overlap)
-                ids = [
-                    f"{pathlib.Path(file_path).stem}_chunk_{i}" for i in range(len(chunks))]
-                metadatas_txt = [{"file": file_path, "chunk_index": i}
-                                 for i in range(len(chunks))]
-                all_docs.extend(chunks)
-                all_ids.extend(ids)
-                all_metadatas.extend(metadatas_txt)
-        if not all_docs:
-            raise Exception("No content found in vectorizable files.")
-        return await chroma_add_documents(collection_name, all_docs, all_ids, all_metadatas)
+                # Stream and chunk text file
+                with open(file_path, 'r', encoding=encoding) as f:
+                    buffer = ""
+                    chunk_idx = 0
+                    while True:
+                        line = f.readline()
+                        if not line:
+                            # End of file
+                            if buffer:
+                                # Add last chunk
+                                ids = [
+                                    f"{pathlib.Path(file_path).stem}_chunk_{chunk_idx}"]
+                                metadatas_txt = [
+                                    {"file": file_path, "chunk_index": chunk_idx}]
+                                await chroma_add_documents(collection_name, [buffer], ids, metadatas_txt)
+                                total_added += 1
+                            break
+                        buffer += line
+                        if len(buffer) >= chunk_size:
+                            # Add chunk
+                            ids = [
+                                f"{pathlib.Path(file_path).stem}_chunk_{chunk_idx}"]
+                            metadatas_txt = [
+                                {"file": file_path, "chunk_index": chunk_idx}]
+                            await chroma_add_documents(collection_name, [buffer], ids, metadatas_txt)
+                            total_added += 1
+                            if overlap > 0:
+                                buffer = buffer[-overlap:]
+                            else:
+                                buffer = ""
+                            chunk_idx += 1
+        return f"Successfully added {total_added} documents to collection {collection_name} in batches."
     finally:
         for tmpdir in temp_dirs:
             tmpdir.cleanup()
@@ -837,61 +867,6 @@ def vectorize_csv(file_path: str, model_name: str = "all-MiniLM-L6-v2") -> tuple
     # So we just return the text and metadata
     metadatas = [{"file": file_path, "row": i} for i in range(len(text_data))]
     return text_data, metadatas
-
-# New MCP tool: Add documents from archive
-@mcp.tool()
-async def chroma_add_documents_from_archive(
-    collection_name: str,
-    archive_path: str,
-    encoding: str = "utf-8",
-    chunk_size: int = 2000,
-    overlap: int = 200,
-    model_name: str = "all-MiniLM-L6-v2"
-) -> str:
-    """Extract an archive (<15MB), find .csv/.txt/.log files, vectorize, and add to a Chroma collection.
-    Args:
-        collection_name: Name of the collection to add documents to
-        archive_path: Path to the archive file
-        encoding: File encoding for .txt/.log (default utf-8)
-        chunk_size: Max size of each chunk for .txt/.log (in characters)
-        overlap: Overlap between chunks (in characters)
-        model_name: SentenceTransformer model for CSVs (default all-MiniLM-L6-v2)
-    Returns:
-        Confirmation message with number of documents added.
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        extracted_files = extract_archive(archive_path, tmpdir)
-        vectorizable = find_vectorizable_files(extracted_files)
-        if not vectorizable:
-            raise Exception("No .csv, .txt, or .log files found in archive.")
-        all_docs = []
-        all_ids = []
-        all_metadatas = []
-        for file_path in vectorizable:
-            ext = pathlib.Path(file_path).suffix.lower()
-            if ext == '.csv':
-                docs, metadatas = vectorize_csv(file_path, model_name)
-                ids = [
-                    f"{pathlib.Path(file_path).stem}_row_{i}" for i in range(len(docs))]
-                all_docs.extend(docs)
-                all_ids.extend(ids)
-                all_metadatas.extend(metadatas)
-            else:  # .txt or .log
-                content = read_file_content(file_path, encoding=encoding)
-                if not content.strip():
-                    continue
-                chunks = chunk_text(
-                    content, chunk_size=chunk_size, overlap=overlap)
-                ids = [
-                    f"{pathlib.Path(file_path).stem}_chunk_{i}" for i in range(len(chunks))]
-                metadatas = [{"file": file_path, "chunk_index": i}
-                             for i in range(len(chunks))]
-                all_docs.extend(chunks)
-                all_ids.extend(ids)
-                all_metadatas.extend(metadatas)
-        if not all_docs:
-            raise Exception("No content found in vectorizable files.")
-        return await chroma_add_documents(collection_name, all_docs, all_ids, all_metadatas)
 
 
 def main():
