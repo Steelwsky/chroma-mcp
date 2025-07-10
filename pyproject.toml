@@ -30,6 +30,8 @@ dependencies = [
     "rarfile>=4.0",
     "sentence-transformers>=4.1.0",
     "py7zr>=0.20.8",
+    "pandas>=2.0.0",
+    "chardet>=5.0.0",
 ]
 
 [project.urls]

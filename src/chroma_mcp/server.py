@@ -19,6 +19,7 @@ import tempfile
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 import py7zr
+import chardet
 
 
 from chromadb.api.collection_configuration import (
@@ -760,7 +761,8 @@ async def chroma_add_documents_from_files(
                         total_added += len(batch_docs)
             else:  # .txt or .log
                 # Stream and chunk text file
-                with open(file_path, 'r', encoding=encoding) as f:
+                file_encoding = detect_encoding(file_path, default=encoding)
+                with open(file_path, 'r', encoding=file_encoding, errors='replace') as f:
                     buffer = ""
                     chunk_idx = 0
                     while True:
@@ -867,6 +869,13 @@ def vectorize_csv(file_path: str, model_name: str = "all-MiniLM-L6-v2") -> tuple
     # So we just return the text and metadata
     metadatas = [{"file": file_path, "row": i} for i in range(len(text_data))]
     return text_data, metadatas
+
+
+def detect_encoding(file_path, default='utf-8'):
+    with open(file_path, 'rb') as f:
+        raw = f.read(4096)
+    result = chardet.detect(raw)
+    return result['encoding'] or default
 
 
 def main():
