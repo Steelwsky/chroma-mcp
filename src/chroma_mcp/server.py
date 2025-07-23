@@ -1,4 +1,4 @@
-from typing import Dict, List, Mapping, Optional, TypedDict, Union
+from typing import Dict, List, Mapping, Optional, TypedDict, Union, Set
 from enum import Enum
 import chromadb
 from mcp.server.fastmcp import FastMCP
@@ -757,11 +757,35 @@ async def chroma_add_documents_from_files(
                         batch_docs = text_data[i:i+BATCH_SIZE]
                         batch_ids = ids[i:i+BATCH_SIZE]
                         batch_metadatas = metadatas_csv[i:i+BATCH_SIZE]
-                        await chroma_add_documents(collection_name, batch_docs, batch_ids, batch_metadatas)
-                        total_added += len(batch_docs)
+                        # Check which IDs already exist
+                        client = get_chroma_client()
+                        collection = client.get_or_create_collection(
+                            collection_name)
+                        existing_csv_ids_set: Set[str] = set(
+                            collection.get(include=[])['ids'])
+                        new_docs, new_ids, new_metas = [], [], []
+                        update_docs, update_ids, update_metas = [], [], []
+                        for doc, id, meta in zip(batch_docs, batch_ids, batch_metadatas):
+                            if id in existing_csv_ids_set:
+                                update_docs.append(doc)
+                                update_ids.append(id)
+                                update_metas.append(meta)
+                            else:
+                                new_docs.append(doc)
+                                new_ids.append(id)
+                                new_metas.append(meta)
+                        if new_docs:
+                            await chroma_add_documents(collection_name, new_docs, new_ids, new_metas)
+                            total_added += len(new_docs)
+                        if update_docs:
+                            await chroma_update_documents(collection_name, update_ids, metadatas=update_metas, documents=update_docs)
             else:  # .txt or .log
                 # Stream and chunk text file
                 file_encoding = detect_encoding(file_path, default=encoding)
+                client = get_chroma_client()
+                collection = client.get_or_create_collection(collection_name)
+                existing_txt_ids_set: Set[str] = set(
+                    collection.get(include=[])['ids'])
                 with open(file_path, 'r', encoding=file_encoding, errors='replace') as f:
                     buffer = ""
                     chunk_idx = 0
@@ -770,23 +794,27 @@ async def chroma_add_documents_from_files(
                         if not line:
                             # End of file
                             if buffer:
-                                # Add last chunk
                                 ids = [
                                     f"{pathlib.Path(file_path).stem}_chunk_{chunk_idx}"]
                                 metadatas_txt = [
                                     {"file": file_path, "chunk_index": chunk_idx}]
-                                await chroma_add_documents(collection_name, [buffer], ids, metadatas_txt)
-                                total_added += 1
+                                if ids[0] in existing_txt_ids_set:
+                                    await chroma_update_documents(collection_name, ids, metadatas=metadatas_txt, documents=[buffer])
+                                else:
+                                    await chroma_add_documents(collection_name, [buffer], ids, metadatas_txt)
+                                    total_added += 1
                             break
                         buffer += line
                         if len(buffer) >= chunk_size:
-                            # Add chunk
                             ids = [
                                 f"{pathlib.Path(file_path).stem}_chunk_{chunk_idx}"]
                             metadatas_txt = [
                                 {"file": file_path, "chunk_index": chunk_idx}]
-                            await chroma_add_documents(collection_name, [buffer], ids, metadatas_txt)
-                            total_added += 1
+                            if ids[0] in existing_txt_ids_set:
+                                await chroma_update_documents(collection_name, ids, metadatas=metadatas_txt, documents=[buffer])
+                            else:
+                                await chroma_add_documents(collection_name, [buffer], ids, metadatas_txt)
+                                total_added += 1
                             if overlap > 0:
                                 buffer = buffer[-overlap:]
                             else:
